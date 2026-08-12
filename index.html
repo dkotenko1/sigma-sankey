@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Sankey — Terminating / Originating Flows</title>
+<!-- Self-contained: all libraries served locally (no external CDN calls). -->
+<script src="react.production.min.js"></script>
+<script src="sigma-plugin.js"></script>
+<script src="echarts.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,Inter,Segoe UI,Roboto,Arial,sans-serif;background:transparent;color:#1c3a47;overflow:hidden}
+  #wrap{height:100%;width:100%;display:flex;flex-direction:column;padding:10px 12px 6px;gap:2px}
+  #top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+  #ttl{font-size:14px;font-weight:800;letter-spacing:.02em;color:#00405c;line-height:1.2}
+  #sub{font-size:11px;color:#6b8290;margin-top:1px}
+  #legend{display:flex;gap:14px;font-size:10.5px;color:#6b8290;padding-top:2px;flex-wrap:wrap}
+  #legend .k{display:flex;align-items:center;gap:5px}
+  #legend .sw{width:22px;height:8px;border-radius:2px;display:inline-block}
+  #chart{flex:1;width:100%;min-height:40px}
+  #msg{display:none;flex:1;align-items:center;justify-content:center;color:#6b8290;font-size:12px;text-align:center;padding:0 28px;line-height:1.5}
+  #note{font-size:10px;color:#a08636;padding:1px 2px 0;display:none}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="top">
+    <div><div id="ttl">Intervention Journey</div><div id="sub" data-role="sub"></div></div>
+    <div id="legend" data-role="legend"></div>
+  </div>
+  <div id="note" data-role="note"></div>
+  <div id="chart"></div>
+  <div id="msg"></div>
+</div>
+<script>
+(function(){
+  "use strict";
+  // current SDK exposes window.SigmaPlugin.client; keep the legacy global as a fallback
+  var client=(window.SigmaPlugin&&window.SigmaPlugin.client)||
+             (window.sigmaComputing&&window.sigmaComputing.plugin&&window.sigmaComputing.plugin.client)||null;
+  var HIDDEN="end";     // control-char sentinels: never collide with real stage names
+  var HIDDENS="start";
+  var SEP="";
+  function isHiddenName(v){ return typeof v==="string" && v.charCodeAt(0)===1; }
+
+  // ---------- editor panel ----------
+  var defs=[
+    {name:"source",type:"element"},
+    {name:"sourceColumn",type:"column",source:"source",label:"Source stage"},
+    {name:"targetColumn",type:"column",source:"source",label:"Target stage"},
+    {name:"valueColumn",type:"column",source:"source",allowedTypes:["number","integer"],label:"Flow value"},
+    {name:"nullMode",type:"dropdown",label:"Null / missing handling",values:["Terminate & originate","Show as node","Drop rows"],defaultValue:"Terminate & originate"},
+    {name:"nullValues",type:"text",label:"Values treated as null",defaultValue:"null, n/a, none, blank"},
+    {name:"orientation",type:"dropdown",label:"Orientation",values:["Horizontal","Vertical"],defaultValue:"Horizontal"},
+    {name:"nodeAlign",type:"dropdown",label:"Node alignment",values:["Left","Right","Justify"],defaultValue:"Left"},
+    {name:"nodeWidth",type:"dropdown",label:"Node width",values:["Thin","Medium","Thick"],defaultValue:"Medium"},
+    {name:"nodeGap",type:"dropdown",label:"Node spacing",values:["Tight","Normal","Roomy"],defaultValue:"Normal"},
+    {name:"linkColor",type:"dropdown",label:"Link color",values:["Gradient","Source","Target"],defaultValue:"Gradient"},
+    {name:"curveness",type:"dropdown",label:"Link curve",values:["Straight","Gentle","Curvy"],defaultValue:"Gentle"},
+    {name:"linkOpacity",type:"dropdown",label:"Link opacity",values:["Light","Medium","Bold"],defaultValue:"Medium"},
+    {name:"showLabels",type:"toggle",label:"Show node labels",defaultValue:true},
+    {name:"labelDetail",type:"dropdown",label:"Label detail",values:["Name only","Name + value","Name + %","Value only"],defaultValue:"Name + value"},
+    {name:"valueFormat",type:"dropdown",label:"Number format",values:["Auto (K/M)","Full number","Thousands (K)"],defaultValue:"Auto (K/M)"},
+    {name:"valuePrefix",type:"text",label:"Value prefix (e.g. $)",defaultValue:""},
+    {name:"highlight",type:"toggle",label:"Highlight connections on hover",defaultValue:true},
+    {name:"showTooltip",type:"toggle",label:"Show tooltips",defaultValue:true},
+    {name:"showLegend",type:"toggle",label:"Show terminate/originate legend",defaultValue:true},
+    {name:"palette",type:"dropdown",label:"Color palette",values:["Outcomes","Teal","Vibrant","Colorblind-safe"],defaultValue:"Outcomes"},
+    {name:"title",type:"text",label:"Title",defaultValue:"Intervention Journey"},
+    {name:"subtitle",type:"text",label:"Subtitle",defaultValue:"Members flow across program stages — bars terminate early and begin late instead of routing to null."}
+  ];
+  if(client) client.config.configureEditorPanel(defs);
+
+  var PALETTES={
+    "Outcomes":["#00405c","#0f6e83","#59bb80","#882475","#2b8fb0","#3c9a6b","#6c3a86","#00668a","#8fce9f","#b06fa3"],
+    "Teal":["#003f5c","#2f6b7e","#4a8a91","#66a99e","#8bc7a3","#b4e0a8","#1b5566","#3d7d82"],
+    "Vibrant":["#2b6cb0","#dd6b20","#38a169","#805ad5","#d53f8c","#3182ce","#d69e2e","#319795"],
+    "Colorblind-safe":["#0072B2","#E69F00","#009E73","#CC79A7","#56B4E9","#D55E00","#F0E442","#999999"]
+  };
+  var NODEW={Thin:10,Medium:18,Thick:28}, NODEG={Tight:6,Normal:14,Roomy:24},
+      CURVE={Straight:0,Gentle:0.5,Curvy:0.72}, OPAC={Light:0.25,Medium:0.45,Bold:0.62};
+
+  // ---------- helpers ----------
+  function parseTokens(s){ return (s==null?"":String(s)).split(",").map(function(x){return x.trim();}).filter(Boolean); }
+  function bool(v,dflt){ if(v===undefined||v===null||v==="") return dflt; if(typeof v==="boolean") return v; var s=String(v).toLowerCase(); return s==="true"||s==="1"||s==="yes"||s==="on"; }
+  function pick(v,dflt){ return (v===undefined||v===null||v==="")?dflt:v; }
+
+  // ---------- data transform (aggregate → null handling → DAG) ----------
+  function transform(rows, tokens, nullMode){
+    var tok={}; tokens.forEach(function(t){var s=t.toLowerCase(); if(s) tok[s]=1;});
+    function isNull(v){ if(v===null||v===undefined) return true; var s=String(v).trim(); if(s==="") return true; return !!tok[s.toLowerCase()]; }
+
+    // 1) aggregate identical (source,target) pairs — makes raw row-level data work, not just pre-summed.
+    var pairs={}, keyOrder=[], order=[], realSet={};
+    function noteNode(n){ if(!(n in realSet)){ realSet[n]=1; order.push(n); } }
+    function addPair(sNode,tNode,value,hidden){
+      var key=sNode+SEP+tNode;
+      if(!pairs[key]){ pairs[key]={value:0,s:sNode,t:tNode,hidden:hidden}; keyOrder.push(key); }
+      pairs[key].value+=value;
+    }
+    rows.forEach(function(r){
+      var value=Number(r.value); if(!isFinite(value)||value<=0) return;
+      var sN=isNull(r.source), tN=isNull(r.target);
+      var s=String(r.source==null?"":r.source).trim(), t=String(r.target==null?"":r.target).trim();
+      if(sN&&tN) return;
+      if(tN){
+        if(nullMode==="Drop rows") return;
+        if(nullMode==="Show as node"){ noteNode(s); noteNode("(null)"); addPair(s,"(null)",value,false); }
+        else { noteNode(s); addPair(s,HIDDEN+":"+s,value,true); }          // terminate
+      } else if(sN){
+        if(nullMode==="Drop rows") return;
+        if(nullMode==="Show as node"){ noteNode("(null)"); noteNode(t); addPair("(null)",t,value,false); }
+        else { noteNode(t); addPair(HIDDENS+":"+t,t,value,true); }         // originate
+      } else {
+        noteNode(s); noteNode(t); addPair(s,t,value,false);
+      }
+    });
+
+    // 2) build a DAG — drop self-loops and any edge that would create a cycle (ECharts sankey requires a DAG)
+    var adj={}, dropped=0, links=[];
+    function reach(from,to){ var st=[from],seen={}; while(st.length){var n=st.pop(); if(n===to)return true; if(seen[n])continue; seen[n]=1; (adj[n]||[]).forEach(function(m){st.push(m);});} return false; }
+    keyOrder.forEach(function(k){
+      var p=pairs[k];
+      if(p.hidden){ links.push({source:p.s,target:p.t,value:p.value,hidden:true}); return; }
+      if(p.s===p.t){ dropped++; return; }
+      if(reach(p.t,p.s)){ dropped++; return; }
+      (adj[p.s]=adj[p.s]||[]).push(p.t);
+      links.push({source:p.s,target:p.t,value:p.value,hidden:false});
+    });
+
+    var nodes=order.map(function(n){return {name:n,hidden:false};});
+    var hiddenNames={};
+    links.forEach(function(l){ if(l.hidden){ [l.source,l.target].forEach(function(n){ if(isHiddenName(n)) hiddenNames[n]=1; }); } });
+    Object.keys(hiddenNames).forEach(function(n){ nodes.push({name:n,hidden:true}); });
+
+    // total starting flow (root outflow) for % labels
+    var incoming={}; links.forEach(function(l){ if(!l.hidden) incoming[l.target]=(incoming[l.target]||0)+1; });
+    var rootTotal=0; links.forEach(function(l){ if(!l.hidden && !incoming[l.source]) rootTotal+=l.value; });
+    if(rootTotal<=0){ links.forEach(function(l){ if(!l.hidden) rootTotal+=l.value; }); }
+    return {nodes:nodes,links:links,dropped:dropped,rootTotal:rootTotal||1};
+  }
+
+  // ---------- number formatting ----------
+  function makeFmt(mode,prefix){
+    prefix=prefix||"";
+    return function(v){
+      v=Number(v)||0; var s;
+      if(mode==="Full number") s=Math.round(v).toLocaleString();
+      else if(mode==="Thousands (K)") s=(v/1000).toFixed(v>=1e5?0:1)+"k";
+      else { var a=Math.abs(v); s = a>=1e9?(v/1e9).toFixed(2)+"B" : a>=1e6?(v/1e6).toFixed(2)+"M" : a>=1e3?(v/1e3).toFixed(1)+"k" : String(Math.round(v)); }
+      return prefix+s;
+    };
+  }
+
+  // ---------- render ----------
+  var chart=null;
+  function ensureChart(){ if(!chart) chart=echarts.init(document.getElementById("chart")); return chart; }
+  function showMsg(t){ document.getElementById("chart").style.display="none"; var m=document.getElementById("msg"); m.style.display="flex"; m.textContent=t; if(chart) chart.clear(); }
+  function hideMsg(){ document.getElementById("chart").style.display="block"; document.getElementById("msg").style.display="none"; }
+
+  function render(cfg, data){
+    var visible=data.nodes.filter(function(n){return !n.hidden;});
+    if(!visible.length || !data.links.length){ showMsg("No flows to display. Bind Source, Target and Value columns with positive numeric values."); return; }
+    hideMsg();
+    var c=ensureChart();
+    var pal=PALETTES[pick(cfg.palette,"Outcomes")]||PALETTES.Outcomes;
+    var colorOf={}; visible.forEach(function(n,i){ colorOf[n.name]=pal[i%pal.length]; });
+    var orient=(pick(cfg.orientation,"Horizontal")==="Vertical")?"vertical":"horizontal";
+    var align=({Left:"left",Right:"right",Justify:"justify"})[pick(cfg.nodeAlign,"Left")]||"left";
+    var opacity=OPAC[pick(cfg.linkOpacity,"Medium")], curve=CURVE[pick(cfg.curveness,"Gentle")];
+    var linkColorMode=pick(cfg.linkColor,"Gradient");
+    var fmt=makeFmt(pick(cfg.valueFormat,"Auto (K/M)"),pick(cfg.valuePrefix,""));
+    var showLabels=bool(cfg.showLabels,true), detail=pick(cfg.labelDetail,"Name + value");
+    var highlight=bool(cfg.highlight,true), showTip=bool(cfg.showTooltip,true);
+    var labelPos = orient==="vertical" ? "bottom" : "right";
+
+    function pctOf(v){ return Math.round(v/data.rootTotal*100); }
+    function nodeLabel(p){
+      if(isHiddenName(p.name) || !showLabels) return "";
+      if(detail==="Name only") return p.name;
+      if(detail==="Value only") return fmt(p.value);
+      if(detail==="Name + %") return p.name+"  "+pctOf(p.value)+"%";
+      return p.name+"  "+fmt(p.value);
+    }
+    function linkStyle(l){
+      var st={opacity:opacity,curveness:curve};
+      if(linkColorMode==="Source") st.color=colorOf[l.source]||"#8aa";
+      else if(linkColorMode==="Target") st.color=colorOf[l.target]||"#8aa";
+      else st.color="gradient";
+      return st;
+    }
+
+    // any outgoing link (including a terminate link) means the node is NOT a right-edge sink
+    var hasOut={}; data.links.forEach(function(l){ hasOut[l.source]=1; });
+    var nodeData=data.nodes.map(function(n){
+      if(n.hidden) return {name:n.name,itemStyle:{color:"rgba(0,0,0,0)",borderWidth:0,opacity:0},label:{show:false},emphasis:{disabled:true},tooltip:{show:false}};
+      // only true right-edge sinks label inward (left) so they never clip the panel edge; everyone else labels right
+      var pos = orient==="vertical" ? labelPos : (hasOut[n.name] ? "right" : "left");
+      return {name:n.name,itemStyle:{color:colorOf[n.name],borderColor:"#fff",borderWidth:1},label:{position:pos}};
+    });
+    var linkData=data.links.map(function(l){
+      if(l.hidden) return {source:l.source,target:l.target,value:l.value,lineStyle:{color:"rgba(0,0,0,0)",opacity:0},emphasis:{disabled:true},tooltip:{show:false}};
+      return {source:l.source,target:l.target,value:l.value,lineStyle:linkStyle(l)};
+    });
+
+    var opt={
+      backgroundColor:"transparent",
+      tooltip: showTip ? {trigger:"item",confine:true,backgroundColor:"rgba(0,64,92,0.94)",borderColor:"#00405c",textStyle:{color:"#fff",fontSize:12},
+        formatter:function(p){
+          if(p.dataType==="edge"){ if(isHiddenName(p.data.source)||isHiddenName(p.data.target)) return ""; return "<b>"+p.data.source+"</b> → <b>"+p.data.target+"</b><br/>"+fmt(p.data.value); }
+          if(p.dataType==="node"){ if(isHiddenName(p.name)) return ""; return "<b>"+p.name+"</b><br/>"+fmt(p.value)+" · "+pctOf(p.value)+"% of start"; }
+          return "";
+        }} : {show:false},
+      series:[{
+        type:"sankey", orient:orient, nodeAlign:align, draggable:true,
+        nodeWidth:NODEW[pick(cfg.nodeWidth,"Medium")], nodeGap:NODEG[pick(cfg.nodeGap,"Normal")],
+        left:8, right: orient==="vertical"?12:44, top: orient==="vertical"?26:6, bottom: orient==="vertical"?26:8,
+        emphasis: highlight ? {focus:"adjacency"} : {disabled:true},
+        label:{show:showLabels,color:"#00405c",fontSize:11,fontWeight:500,position:labelPos,formatter:nodeLabel},
+        lineStyle:{color:"gradient",opacity:opacity,curveness:curve},
+        data:nodeData, links:linkData
+      }]
+    };
+    try{ c.setOption(opt,true); c.resize(); }
+    catch(err){ showMsg("Unable to render this data as a Sankey. "+(err&&err.message?err.message:"")); }
+  }
+
+  // ---------- top-of-panel chrome ----------
+  function setChrome(cfg,dropped){
+    document.getElementById("ttl").textContent=pick(cfg.title,"Intervention Journey");
+    document.querySelector('[data-role="sub"]').textContent=pick(cfg.subtitle,"");
+    var leg=document.querySelector('[data-role="legend"]');
+    var mode=pick(cfg.nullMode,"Terminate & originate");
+    if(bool(cfg.showLegend,true) && mode==="Terminate & originate"){
+      leg.innerHTML='<span class="k"><span class="sw" style="background:linear-gradient(90deg,#59bb80,rgba(89,187,128,0))"></span>terminates (ends at stage)</span>'+
+                    '<span class="k"><span class="sw" style="background:linear-gradient(90deg,rgba(136,36,117,0),#882475)"></span>begins late (enters mid-flow)</span>';
+      leg.style.display="flex";
+    } else { leg.innerHTML=""; leg.style.display="none"; }
+    var note=document.querySelector('[data-role="note"]');
+    if(dropped>0){ note.style.display="block"; note.textContent="Note: "+dropped+" cyclic/self-referencing link"+(dropped>1?"s":"")+" hidden to keep the flow a valid left-to-right journey."; }
+    else note.style.display="none";
+  }
+
+  // ---------- synthetic fallback (medication-adherence intervention funnel) ----------
+  function synth(){
+    var r=[["Outreach Attempted","Consult Completed",6380000],["Outreach Attempted","Unsuccessful",599320],
+      ["Outreach Attempted","null",1970000],["Member Available","Consult Completed",421840],
+      ["Withdrawn","null",1510000],["null","Consult Completed",300000],
+      ["Consult Completed","Adherence Improved",3000000],["Consult Completed","Not Eligible",640000],
+      ["Consult Completed","No Intervention Needed",2360000],["Consult Completed","null",400000],
+      ["Unsuccessful","null",599320]];
+    return r.map(function(x){return {source:x[0],target:x[1],value:x[2]};});
+  }
+
+  // ---------- state & wiring ----------
+  var st={cfg:{},data:null,unsub:null};
+  function recompute(){
+    var cfg=st.cfg||{};
+    var tokens=parseTokens(pick(cfg.nullValues,"null, n/a, none, blank"));
+    var mode=pick(cfg.nullMode,"Terminate & originate");
+    var rows=null;
+    if(st.data&&cfg.sourceColumn&&cfg.targetColumn&&cfg.valueColumn){
+      var S=st.data[cfg.sourceColumn]||[],T=st.data[cfg.targetColumn]||[],V=st.data[cfg.valueColumn]||[];
+      var n=Math.max(S.length,T.length,V.length);
+      if(n>0){ rows=[]; for(var i=0;i<n;i++) rows.push({source:S[i],target:T[i],value:V[i]}); }
+    }
+    if(!rows) rows=synth();
+    var data=transform(rows,tokens,mode);
+    setChrome(cfg,data.dropped);
+    render(cfg,data);
+  }
+
+  // base config from the URL query (standalone/dev preview, e.g. ?orientation=Vertical);
+  // when embedded in Sigma, client.config.subscribe overrides it with the real config.
+  (function(){ var q={}; (location.search||"").replace(/^\?/,"").split("&").forEach(function(kv){ if(!kv)return; var p=kv.split("="); q[decodeURIComponent(p[0])]=decodeURIComponent((p[1]||"").replace(/\+/g," ")); }); st.cfg=q; })();
+  recompute(); // always paint immediately (synthetic sample) so the panel is never blank
+
+  if(client){
+    client.config.subscribe(function(cfg){
+      st.cfg=cfg||{};
+      if(st.unsub){ st.unsub(); st.unsub=null; }
+      if(cfg&&cfg.source){ st.unsub=client.elements.subscribeToElementData(cfg.source,function(d){ st.data=d; recompute(); }); }
+      recompute();
+    });
+  }
+
+  // Sigma sizes the iframe AFTER first paint — always redraw on resize (the #1 "wonky plugin" fix).
+  var ro=new ResizeObserver(function(){ if(chart) chart.resize(); });
+  ro.observe(document.getElementById("chart"));
+  window.addEventListener("resize",function(){ if(chart) chart.resize(); });
+})();
+</script>
+</body>
+</html>
